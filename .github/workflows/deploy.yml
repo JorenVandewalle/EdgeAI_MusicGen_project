@@ -7,11 +7,14 @@ on:
 env:
   REGISTRY: ghcr.io
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   # --- STAP 1: BOUWEN (Op de Dev VM) ---
   build_image:
-    # We sturen dit naar de runner ZONDER 'production' label (dus je Dev VM)
-    runs-on: [self-hosted, Linux, X64] 
+    runs-on: [self-hosted, Linux, X64]
     
     steps:
       - name: Checkout code
@@ -37,8 +40,7 @@ jobs:
 
   # --- STAP 2: DEPLOYEN (Op de Productie VM) ---
   deploy_prod:
-    needs: build_image  # Wacht tot het bouwen klaar is
-    # Hier sturen we het specifiek naar de runner met het label 'production'
+    needs: build_image
     runs-on: [self-hosted, production]
     
     steps:
