@@ -1,13 +1,13 @@
-# STAGE 1: Bouwer (Compileren)
-FROM python:3.9-bookworm AS builder
+# --- STAGE 1: Bouwen van FFmpeg (nodig voor AudioCraft) ---
+FROM python:3.9-slim-bookworm as builder
 
-# Installeer alleen wat nodig is om te bouwen
+# Installeer tools om te bouwen
 RUN apt-get update && \
     apt-get install -y build-essential pkg-config wget yasm nasm libtool autoconf automake \
     libx264-dev libx265-dev libvpx-dev libmp3lame-dev && \
     apt-get clean
 
-# Compileer FFmpeg
+# Download en compileer FFmpeg (Versie 5.1 is stabiel voor AudioCraft)
 WORKDIR /tmp
 RUN wget https://ffmpeg.org/releases/ffmpeg-5.1.tar.bz2 && \
     tar xjf ffmpeg-5.1.tar.bz2 && \
@@ -18,34 +18,39 @@ RUN wget https://ffmpeg.org/releases/ffmpeg-5.1.tar.bz2 && \
     make -j$(nproc) && \
     make install
 
-# ---------------------------------------------------------
+# --- STAGE 2: De Echte Image (Runtime) ---
+FROM python:3.9-slim-bookworm
 
-# STAGE 2: Eind Image (Alleen runtime)
-FROM python:3.9-bookworm
-
-# Installeer runtime libraries (geen compilers meer nodig!)
+# Installeer runtime libraries voor FFmpeg
 RUN apt-get update && \
     apt-get install -y libx264-dev libx265-dev libvpx-dev libmp3lame-dev && \
     apt-get remove -y libavcodec-dev libavformat-dev libavutil-dev && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Kopieer de gecompileerde FFmpeg uit de 'builder' stage
+# Kopieer de gebouwde FFmpeg van de vorige stap
 COPY --from=builder /usr/local /usr/local
 
-# Update library links
+# Update de bibliotheek-links
 RUN ldconfig
 
-# Environment
-ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV CFLAGS="-I/usr/local/include"
-ENV LDFLAGS="-L/usr/local/lib"
-
-# Python Packages (Nu hebben we veel meer ruimte!)
+# 1. Installeer PyTorch (CUDA versie)
 RUN python -m pip install --no-cache-dir torch==2.1.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# 2. Installeer PyAV (Audio verwerking)
 RUN python -m pip install --no-cache-dir av==11.0.0
+
+# 3. Installeer AudioCraft, Gradio en Xformers
+# We pinnen numpy<2.0 om compatibiliteitsproblemen te voorkomen
 RUN python -m pip install --no-cache-dir audiocraft "gradio==3.50.2" xformers "numpy<2.0" "transformers==4.37.2"
 
+# Maak de werkmap aan
 WORKDIR /app
+
+# ---> HIER GING HET FOUT: Kopieer al jouw code naar de container <---
+COPY . .
+
+# Open de poort
 EXPOSE 7860
-CMD ["python", "-u", "full_app.py", "--listen", "0.0.0.0", "--server_port", "7860"]
+
+# Start het commando
+CMD ["python", "full_app.py", "--listen", "0.0.0.0", "--server_port", "7860"]
