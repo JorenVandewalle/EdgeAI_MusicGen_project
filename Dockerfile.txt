@@ -1,0 +1,68 @@
+# We gebruiken Python 3.9 op Debian Bookworm (stabiel)
+FROM python:3.9-bookworm
+
+# 1. Installeer systeem dependencies
+RUN apt-get update && \
+    apt-get install -y \
+    build-essential \
+    pkg-config \
+    wget \
+    yasm \
+    nasm \
+    libtool \
+    autoconf \
+    automake \
+    libx264-dev \
+    libx265-dev \
+    libvpx-dev \
+    libmp3lame-dev && \
+    apt-get remove -y libavcodec-dev libavformat-dev libavutil-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 2. Compileer FFmpeg 5.1
+WORKDIR /tmp
+RUN wget https://ffmpeg.org/releases/ffmpeg-5.1.tar.bz2 && \
+    tar xjf ffmpeg-5.1.tar.bz2 && \
+    cd ffmpeg-5.1 && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-shared \
+        --disable-doc \
+        --enable-gpl \
+        --enable-version3 \
+        --enable-nonfree \
+        --disable-x86asm \
+        --disable-inline-asm \
+        --enable-libx264 \
+        --enable-libx265 \
+        --enable-libvpx \
+        --enable-libmp3lame && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd /tmp && \
+    rm -rf ffmpeg-5.1 ffmpeg-5.1.tar.bz2
+
+# 3. Environment Variabelen
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV CFLAGS="-I/usr/local/include"
+ENV LDFLAGS="-L/usr/local/lib"
+
+# 4. Installeer Python packages (GESPLITST OM RUIMTE TE BESPAREN)
+
+# Stap 4a: Eerst de zware jongen (PyTorch) expliciet installeren
+# Dit voorkomt dat pip in de war raakt en alles tegelijk probeert te cachen
+RUN python -m pip install --no-cache-dir torch==2.1.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Stap 4b: Installeer PyAV (moet linken tegen onze custom FFmpeg)
+RUN python -m pip install --no-cache-dir av==11.0.0
+
+# Stap 4c: Installeer de rest (Audiocraft, Gradio en fixes)
+RUN python -m pip install --no-cache-dir audiocraft gradio && \
+    python -m pip install --no-cache-dir "numpy<2.0" "transformers==4.37.2"
+
+# 5. Setup
+WORKDIR /app
+EXPOSE 7860
+CMD ["python", "-u", "full_app.py", "--listen", "0.0.0.0", "--server_port", "7860", "--share"]
