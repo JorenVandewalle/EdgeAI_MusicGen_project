@@ -6,7 +6,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # We halen IMAGE_NAME hier weg en zetten hem dynamisch in de steps
 
 jobs:
   build-test-deploy:
@@ -20,7 +20,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # 2. Inloggen op GitHub Container Registry
+      # 2. NAAM FIXEN (Hoofdletters naar kleine letters)
+      - name: Lowercase Repo Name
+        run: |
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      # 3. Inloggen op GitHub Container Registry
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v2
         with:
@@ -28,7 +33,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3. Bouwen (Lokaal voor de test)
+      # 4. Bouwen (Lokaal voor de test)
       - name: Build Docker image (Local)
         uses: docker/build-push-action@v4
         with:
@@ -37,12 +42,12 @@ jobs:
           tags: test-image:local
           file: Dockerfile
 
-      # 4. De Test Draaien (Sanity Check)
+      # 5. De Test Draaien (Sanity Check)
       - name: Run Sanity Check (Test)
         run: |
           docker run --rm -v ${{ github.workspace }}:/app test-image:local python test_ci.py
 
-      # 5. Pushen naar GitHub (Alleen als test slaagt)
+      # 6. Pushen naar GitHub (Nu met kleine letters!)
       - name: Push Docker image
         uses: docker/build-push-action@v4
         with:
@@ -51,7 +56,7 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           file: Dockerfile
 
-      # 6. Deploy naar Productie (Via SSH)
+      # 7. Deploy naar Productie
       - name: Deploy to Production VM
         uses: appleboy/ssh-action@master
         with:
@@ -59,13 +64,13 @@ jobs:
           username: ${{ secrets.PROD_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
-            # Inloggen op registry
+            # Inloggen
             echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             
             # Nieuwe versie ophalen
             docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             
-            # Oude container stoppen (GPU vrijgeven)
+            # Oude container stoppen
             docker stop musicgen_prod || true
             docker rm musicgen_prod || true
             
@@ -79,10 +84,10 @@ jobs:
               -v /root/musicproject_prod/generated:/app/generated \
               ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             
-            # Opruimen oude images
+            # Opruimen
             docker image prune -f
 
-      # 7. Schoonmaak op Dev VM
+      # 8. Schoonmaak op Dev VM
       - name: Cleanup Dev VM
         if: always()
         run: docker image prune -f
