@@ -46,7 +46,6 @@ RUN python -m pip install --no-cache-dir audiocraft "gradio==3.50.2" xformers "n
 # Maak de werkmap aan
 WORKDIR /app
 
-# ---> HIER GING HET FOUT: Kopieer al jouw code naar de container <---
 COPY . .
 
 # Open de poort
