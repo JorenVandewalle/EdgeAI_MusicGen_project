@@ -1,5 +1,22 @@
-cache/
+# Python cache (onnodige bestanden)
 __pycache__/
 *.pyc
+
+# De map met de zware AI-modellen (Gigabytes groot!)
+cache/
+
+# De map met je muziekresultaten
 generated/
+
+# Losse audiobestanden die per ongeluk in de hoofdmap staan
+*.wav
+*.mp3
+*.json
+
+# GitHub Runner Software (BELANGRIJK: Dit mag niet naar GitHub!)
+actions-runner/
+_work/
+
+# Systeem/Env bestanden
 .env
+.DS_Store

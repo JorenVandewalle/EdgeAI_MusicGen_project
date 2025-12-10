@@ -6,26 +6,25 @@ import sys
 import time
 import gc
 import shutil
+import json
+import random
+from tempfile import NamedTemporaryFile  # <--- Deze ontbrak!
 import torch
 import gradio as gr
-from transformers import pipeline
 from audiocraft.models import MusicGen, MultiBandDiffusion
 from audiocraft.data.audio import audio_write
 from audiocraft.data.audio_utils import convert_audio
 
 # --- CONFIGURATIE ---
-# Map waar bestanden permanent worden opgeslagen
 OUTPUT_DIR = "generated"
-os.makedirs(OUTPUT_DIR, exist_ok=True) # Maakt de map aan als hij niet bestaat
-
-# Geheugen optimalisatie
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
 MODEL = None
 MBD = None
-PROMPT_AI = None
 INTERRUPTING = False
 USE_DIFFUSION = False
+LAST_METADATA = {} 
 
 # Fix FFmpeg logs
 _old_call = sp.call
@@ -40,58 +39,48 @@ def interrupt():
     INTERRUPTING = True
 
 def free_memory():
-    """Maakt geheugen vrij tussen generaties door"""
     gc.collect()
     torch.cuda.empty_cache()
     if torch.cuda.is_available():
         torch.cuda.ipc_collect()
 
-# --- AI PROMPT HELPER ---
-def enhance_prompt(user_text):
-    global PROMPT_AI
-    if not user_text: return "Please type something..."
-    
-    if PROMPT_AI is None:
-        print("Loading Prompt AI...")
-        PROMPT_AI = pipeline('text-generation', model='distilgpt2', device=0 if torch.cuda.is_available() else -1)
-    
-    base = f"Music description: {user_text} -> {user_text}, high fidelity, stereo, "
-    res = PROMPT_AI(base, max_new_tokens=40, num_return_sequences=1)[0]['generated_text']
-    output = res.split('->')[-1].strip().split('\n')[0]
-    return output
+def set_all_seeds(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
 
 # --- SAVING HELPER ---
 def save_track(current_file, filename_input):
-    if current_file is None:
-        return "⚠️ Genereer eerst muziek voordat je opslaat!"
+    global LAST_METADATA
     
-    if not filename_input:
-        filename_input = f"track_{int(time.time())}"
+    if current_file is None: return "⚠️ Genereer eerst muziek!"
+    if not filename_input: filename_input = f"track_{int(time.time())}"
     
-    # 1. Maak de bestandsnaam veilig (verwijder rare tekens)
     safe_name = "".join([c for c in filename_input if c.isalnum() or c in " _-"])
-    if not safe_name: safe_name = "unnamed_track"
+    if not safe_name: safe_name = "unnamed"
     
-    # 2. Bepaal het pad
-    target_path = os.path.join(OUTPUT_DIR, f"{safe_name}.wav")
+    wav_path = os.path.join(OUTPUT_DIR, f"{safe_name}.wav")
+    json_path = os.path.join(OUTPUT_DIR, f"{safe_name}.json")
     
-    # 3. Kopieer het bestand
     try:
-        shutil.copy(current_file, target_path)
-        return f"✅ Opgeslagen in map '{OUTPUT_DIR}' als: {safe_name}.wav"
+        shutil.copy(current_file, wav_path)
+        with open(json_path, 'w') as f:
+            json.dump(LAST_METADATA, f, indent=4)
+        return f"✅ Opgeslagen: {safe_name}.wav"
     except Exception as e:
-        return f"❌ Fout bij opslaan: {e}"
+        return f"❌ Fout: {e}"
 
 # --- MODEL LADEN ---
 def load_model(version):
     global MODEL
     print(f"Loading MusicGen Model: {version}...")
-    
     if MODEL is not None and MODEL.name != version:
         del MODEL
         MODEL = None
         free_memory()
-    
     if MODEL is None:
         try:
             MODEL = MusicGen.get_pretrained(version)
@@ -105,30 +94,43 @@ def load_diffusion():
         MBD = MultiBandDiffusion.get_mbd_musicgen()
 
 # --- GENERATIE LOGICA ---
-def predict(model_name, decoder, text, melody, duration, topk, topp, temperature, cfg_coef):
-    global INTERRUPTING, USE_DIFFUSION
+def predict(model_name, decoder, text, melody, duration, topk, topp, temperature, cfg_coef, seed):
+    global INTERRUPTING, USE_DIFFUSION, LAST_METADATA
     INTERRUPTING = False
     
-    print(f"\n--- START: {text} ({duration}s) ---")
+    # Kwaliteits-boost hardcoded toevoegen (behalve bij lo-fi)
+    if "lo-fi" not in text.lower() and "high fidelity" not in text:
+        text += ", high fidelity, wide stereo, 44kHz, crisp quality, well produced"
+
+    if seed == -1 or seed is None:
+        seed = random.randint(0, 2**32 - 1)
+    set_all_seeds(seed)
+    
+    print(f"\n--- START: {text} ({duration}s) [Seed: {seed}] ---")
     free_memory()
 
     if melody is not None and "melody" not in model_name:
-        raise gr.Error(f"Model '{model_name}' kan geen audio input gebruiken. Kies een 'melody' model.")
+        raise gr.Error(f"Model '{model_name}' ondersteunt geen melodie-input. Kies een 'melody' model.")
 
     load_model(model_name)
     
-    if decoder == "MultiBand_Diffusion":
-        USE_DIFFUSION = True
-        load_diffusion()
-    else:
+    # Auto-fix voor Stereo + Diffusion
+    if "stereo" in model_name and decoder == "MultiBand_Diffusion":
+        print("⚠️ WAARSCHUWING: Diffusion werkt niet met Stereo. Fallback naar Default.")
+        decoder = "Default"
         USE_DIFFUSION = False
+    else:
+        USE_DIFFUSION = (decoder == "MultiBand_Diffusion")
+    
+    if USE_DIFFUSION:
+        load_diffusion()
 
     MODEL.set_generation_params(
         duration=duration, top_k=int(topk), top_p=topp, temperature=temperature, cfg_coef=cfg_coef
     )
     
     def _progress(generated, to_generate):
-        if INTERRUPTING: raise gr.Error("Gestopt door gebruiker.")
+        if INTERRUPTING: raise gr.Error("Gestopt.")
     MODEL.set_custom_progress_callback(_progress)
 
     melody_wavs = None
@@ -148,51 +150,58 @@ def predict(model_name, decoder, text, melody, duration, topk, topp, temperature
     except RuntimeError as e:
         if "out of memory" in str(e):
             free_memory()
-            raise gr.Error("GPU Geheugen Vol! Probeer een kortere duur.")
+            raise gr.Error("GPU Geheugen Vol! Probeer kortere duur.")
         raise e
 
     if USE_DIFFUSION and MBD:
         try:
             wav = MBD.tokens_to_wav(wav[1])
-        except RuntimeError:
-            print("Diffusion OOM, fallback to default")
+        except Exception as e:
+            print(f"Diffusion Error: {e}, fallback.")
             wav = MODEL.compression_model.decode(wav[1])
 
-    # Sla tijdelijk bestand op in /tmp (zodat Gradio het kan tonen)
+    # HIER GING HET FOUT - Nu is NamedTemporaryFile wel geïmporteerd
     with NamedTemporaryFile("wb", suffix=".wav", delete=False) as tfile:
         audio_write(tfile.name, wav[0].cpu(), MODEL.sample_rate, strategy="peak", loudness_compressor=False, add_suffix=False)
         filename = tfile.name
     
+    LAST_METADATA = {
+        "prompt": text, "model": model_name, "seed": seed,
+        "duration": duration, "cfg": cfg_coef, "decoder": decoder,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
     print("--- KLAAR ---")
-    return filename
+    return filename, seed
 
 # --- GUI ---
 def ui_full(launch_kwargs):
-    with gr.Blocks(title="MusicGen Ultimate", theme=gr.themes.Base()) as interface:
-        gr.Markdown("# 🎹 MusicGen Ultimate")
+    theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="slate")
+    
+    with gr.Blocks(title="MusicGen Pro", theme=theme) as interface:
+        gr.Markdown("# 🎹 MusicGen Pro Studio")
         
         with gr.Row():
             with gr.Column(scale=1):
-                with gr.Group():
-                    text = gr.Textbox(label="Beschrijving", placeholder="Typ hier (bv: 'Techno')...", lines=2)
-                    magic_btn = gr.Button("✨ Verbeter Prompt met AI")
-                    magic_btn.click(enhance_prompt, inputs=text, outputs=text)
+                text = gr.Textbox(label="Beschrijving", placeholder="Typ hier (bv: 'Techno')...", lines=2)
 
                 with gr.Tab("Instellingen"):
                     model = gr.Dropdown(
                         [
+                            "facebook/musicgen-small",
                             "facebook/musicgen-stereo-medium",
                             "facebook/musicgen-stereo-large",
                             "facebook/musicgen-stereo-melody",
                             "facebook/musicgen-large",
                         ],
-                        label="Kies Model", value="facebook/musicgen-stereo-medium"
+                        label="Model", value="facebook/musicgen-stereo-medium"
                     )
                     duration = gr.Slider(5, 60, value=30, step=5, label="Duur")
                     decoder = gr.Radio(["Default", "MultiBand_Diffusion"], label="Kwaliteit", value="Default")
+                    seed_input = gr.Number(label="Seed (-1 = Random)", value=-1, precision=0)
 
                 with gr.Tab("Audio Uploaden"):
-                    melody = gr.Audio(source="upload", type="numpy", label="Upload melodie")
+                    melody = gr.Audio(source="upload", type="numpy", label="Melodie Input")
 
                 with gr.Accordion("Expert", open=False):
                     cfg_coef = gr.Slider(1.0, 10.0, value=3.0, label="Guidance")
@@ -205,23 +214,22 @@ def ui_full(launch_kwargs):
                     stop = gr.Button("🛑 Stop")
 
             with gr.Column(scale=1):
-                # De Audio Output Speler
                 output = gr.Audio(label="Resultaat", type="filepath")
+                used_seed_output = gr.Number(label="Gebruikte Seed", interactive=False)
                 
-                # --- NIEUW: OPSLAAN SECTIE ---
-                gr.Markdown("### 💾 Opslaan op Server")
+                gr.Markdown("### 💾 Opslaan")
                 with gr.Row():
-                    filename_input = gr.Textbox(label="Bestandsnaam", placeholder="Mijn_Techno_Track", scale=3)
+                    filename_input = gr.Textbox(label="Bestandsnaam", placeholder="Mijn_Track", scale=3)
                     save_btn = gr.Button("Opslaan", scale=1)
                 
                 save_status = gr.Label(label="Status")
-                
-                # Koppel de save knop
-                # inputs=[output, filename_input] -> pakt het bestand uit de speler + de tekst
                 save_btn.click(save_track, inputs=[output, filename_input], outputs=save_status)
-                # -----------------------------
 
-        submit.click(predict, inputs=[model, decoder, text, melody, duration, topk, topp, temperature, cfg_coef], outputs=[output])
+        submit.click(
+            predict, 
+            inputs=[model, decoder, text, melody, duration, topk, topp, temperature, cfg_coef, seed_input], 
+            outputs=[output, used_seed_output]
+        )
         stop.click(interrupt, queue=False)
 
         interface.queue().launch(**launch_kwargs)

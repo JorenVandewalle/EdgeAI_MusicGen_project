@@ -1,0 +1,88 @@
+name: MusicGen CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-test-deploy:
+    runs-on: self-hosted
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # 1. Code ophalen
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # 2. Inloggen op GitHub Container Registry
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 3. Bouwen (Lokaal voor de test)
+      - name: Build Docker image (Local)
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          load: true
+          tags: test-image:local
+          file: Dockerfile
+
+      # 4. De Test Draaien (Sanity Check)
+      - name: Run Sanity Check (Test)
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/app test-image:local python test_ci.py
+
+      # 5. Pushen naar GitHub (Alleen als test slaagt)
+      - name: Push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          file: Dockerfile
+
+      # 6. Deploy naar Productie (Via SSH)
+      - name: Deploy to Production VM
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            # Inloggen op registry
+            echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
+            # Nieuwe versie ophalen
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            
+            # Oude container stoppen (GPU vrijgeven)
+            docker stop musicgen_prod || true
+            docker rm musicgen_prod || true
+            
+            # Nieuwe container starten
+            docker run -d \
+              --name musicgen_prod \
+              --restart unless-stopped \
+              --gpus all \
+              -p 7860:7860 \
+              -v /root/musicproject_prod/cache:/root/.cache \
+              -v /root/musicproject_prod/generated:/app/generated \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            
+            # Opruimen oude images
+            docker image prune -f
+
+      # 7. Schoonmaak op Dev VM
+      - name: Cleanup Dev VM
+        if: always()
+        run: docker image prune -f
