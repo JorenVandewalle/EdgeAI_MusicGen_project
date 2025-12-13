@@ -21,7 +21,7 @@ RUN wget https://ffmpeg.org/releases/ffmpeg-5.1.tar.bz2 && \
 # --- STAGE 2: De Echte Image (Runtime) ---
 FROM python:3.9-slim-bookworm
 
-# FIX: We installeren build-essential en pkg-config OOK hier, zodat 'av' kan installeren
+# Installeren build-essential en pkg-config
 RUN apt-get update && \
     apt-get install -y build-essential pkg-config \
     libx264-dev libx265-dev libvpx-dev libmp3lame-dev && \
@@ -36,11 +36,11 @@ RUN ldconfig
 # 1. Installeer PyTorch
 RUN python -m pip install --no-cache-dir torch==2.1.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# 2. Installeer PyAV (Dit werkt nu wel omdat build-essential aanwezig is!)
+# 2. Installeer PyAV
 RUN python -m pip install --no-cache-dir av==11.0.0
 
-# 3. Installeer AudioCraft en de rest
-RUN python -m pip install --no-cache-dir audiocraft "gradio==3.50.2" xformers "numpy<2.0" "transformers==4.37.2"
+# 3. Installeer AudioCraft, Demucs en de rest
+RUN python -m pip install --no-cache-dir audiocraft "gradio==3.50.2" xformers "numpy<2.0" "transformers==4.37.2" demucs
 
 # Maak de werkmap aan
 WORKDIR /app
