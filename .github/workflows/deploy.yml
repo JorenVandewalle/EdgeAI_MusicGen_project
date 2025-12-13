@@ -1,6 +1,6 @@
 name: Build and Push Docker image
 
-# Trigger de workflow bij een push naar main OF test-features
+# Trigger de workflow bij een push naar main of de feature branch
 on:
   push:
     branches: [ "main", "test-features" ]
@@ -10,9 +10,9 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Job 1: Bouwen & Pushen (Draait voor alle branches in de lijst hierboven)
+  # Job 1: Build & Push (Uitgevoerd op de self-hosted runner voor prestatiewinst)
   build_and_push:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted]
     permissions:
       contents: read
       packages: write
@@ -41,20 +41,24 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          
+      # Opschonen van de build cache om schijfruimte te besparen op de VM
+      - name: Prune Docker builder cache
+        run: docker builder prune -f
 
-  # Job 2: Deploy naar Productie (Draait ALLEEN als de branch 'main' is)
+  # Job 2: Deploy naar Productie (Alleen uitgevoerd op de main branch)
   deploy_prod:
     needs: build_and_push
-    if: github.ref == 'refs/heads/main'  # Beveiliging: voorkomt deploy vanaf test-takken
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, production]
 
     steps:
       - name: Pull Docker image
         run: |
-          # Login bij GitHub Container Registry
+          # Login bij Registry
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
           
-          # Zet image naam om naar kleine letters en pull de main tag
+          # Haal de specifieke main tag binnen
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           docker pull $IMAGE_ID:main
 
@@ -67,7 +71,7 @@ jobs:
         run: |
           IMAGE_ID=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
           
-          # Start container met productie-volumes
+          # Start container met persistente volumes voor cache en output
           docker run -d \
             --name musicgen_prod \
             --restart unless-stopped \
