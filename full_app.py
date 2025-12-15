@@ -9,6 +9,7 @@ import shutil
 import json
 import random
 import glob
+import re
 from tempfile import NamedTemporaryFile
 import torch
 import gradio as gr
@@ -16,20 +17,27 @@ from audiocraft.models import MusicGen, MultiBandDiffusion
 from audiocraft.data.audio import audio_write
 from audiocraft.data.audio_utils import convert_audio
 
-# --- CONFIGURATIE ---
+# --- GLOBAL CONFIGURATION ---
 OUTPUT_DIR = "generated"
 SEPARATED_DIR = "generated/separated"
+
+# Ensure output directories exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(SEPARATED_DIR, exist_ok=True)
+
+# Optimize PyTorch memory allocation to reduce fragmentation
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
+# Global state variables
 MODEL = None
 MBD = None
 INTERRUPTING = False
 USE_DIFFUSION = False
 LAST_METADATA = {} 
 
-# Fix FFmpeg logs
+# --- UTILITIES ---
+
+# Override subprocess call to suppress verbose FFmpeg stderr output
 _old_call = sp.call
 def _call_nostderr(*args, **kwargs):
     kwargs['stderr'] = sp.DEVNULL
@@ -38,17 +46,22 @@ def _call_nostderr(*args, **kwargs):
 sp.call = _call_nostderr
 
 def interrupt():
+    """Signal the generation process to stop."""
     global INTERRUPTING
     INTERRUPTING = True
 
 def free_memory():
-    """Maakt GPU geheugen vrij voor de volgende taak"""
+    """
+    Forcefully release GPU memory resources.
+    Critical when switching between heavy models (MusicGen <-> Demucs).
+    """
     gc.collect()
     torch.cuda.empty_cache()
     if torch.cuda.is_available():
         torch.cuda.ipc_collect()
 
 def set_all_seeds(seed):
+    """Set seeds for reproducibility across random, numpy, and torch."""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     torch.manual_seed(seed)
@@ -56,18 +69,37 @@ def set_all_seeds(seed):
         torch.cuda.manual_seed(seed)
         torch.backends.cudnn.deterministic = True
 
-# --- DEMUCS (STEM SEPARATION) LOGICA ---
+# --- STEM SEPARATION LOGIC (DEMUCS) ---
+
 def separate_audio(audio_path):
+    """
+    Separate an audio file into 4 stems (Drums, Bass, Other, Vocals) using the Demucs model.
+    
+    Args:
+        audio_path (str): Path to the input audio file.
+        
+    Returns:
+        list: Paths to the 4 generated wav files, or None if failed.
+    """
     global MODEL, MBD
     
     if not audio_path:
-        raise gr.Error("Upload eerst een audiobestand!")
+        raise gr.Error("No audio file provided.")
 
-    print(f"\n--- START SPLITSEN: {audio_path} ---")
+    # 1. Filename Sanitization
+    # Gradio appends temporary identifiers (e.g., -0-100). We strip these to recover the original name.
+    original_filename = os.path.splitext(os.path.basename(audio_path))[0]
+    cleaner_name = re.sub(r'-\d+-\d+$', '', original_filename)
     
-    # 1. BELANGRIJK: Gooi MusicGen uit het geheugen om ruimte te maken voor Demucs
+    # Ensure filesystem compatibility (alphanumeric, underscores, hyphens only)
+    safe_name = "".join([c for c in cleaner_name if c.isalnum() or c in " _-"]).strip().replace(" ", "_")
+    if not safe_name: safe_name = "audio"
+
+    print(f"\n--- START SEPARATION PROCESS: {safe_name} ---")
+    
+    # 2. Resource Management
+    # Unload MusicGen models to prevent Out-Of-Memory (OOM) errors during separation
     if MODEL is not None:
-        print("Cleaning up MusicGen to free VRAM...")
         del MODEL
         MODEL = None
     if MBD is not None:
@@ -75,40 +107,42 @@ def separate_audio(audio_path):
         MBD = None
     free_memory()
 
-    # 2. Bereid mappen voor
-    # We gebruiken de bestandsnaam (zonder extensie) als mapnaam
-    filename = os.path.splitext(os.path.basename(audio_path))[0]
-    # Maak de naam veilig (geen rare tekens)
-    filename = "".join([c for c in filename if c.isalnum() or c in " _-"])
-    out_path = os.path.join(SEPARATED_DIR, filename)
+    # 3. Directory Structure
+    # Enforce a predictable structure: generated/separated/htdemucs/{SongName}_stems/
+    folder_name = f"{safe_name}_stems"
+    target_folder = os.path.join(SEPARATED_DIR, "htdemucs", folder_name)
+
+    # Clean up previous artifacts for this specific track
+    if os.path.exists(target_folder):
+        try:
+            shutil.rmtree(target_folder)
+        except Exception as e:
+            print(f"Warning: Failed to clean output directory {target_folder}: {e}")
     
-    # 3. Roep Demucs aan via command line (stabieler voor geheugen)
-    # -n htdemucs = High Quality Hybrid Transformer model
+    # 4. Execute Demucs via CLI
+    # We use subprocess for better stability and memory isolation.
+    # The --filename flag forces the naming convention: {folder}/{name}_{stem}.wav
     command = [
         "demucs",
         "-n", "htdemucs", 
         "-o", SEPARATED_DIR,
-        "--filename", "{track}/{stem}.{ext}", # Forceer bestandsstructuur
+        "--filename", f"{folder_name}/{safe_name}_{{stem}}.{{ext}}",
         audio_path
     ]
     
     try:
         sp.run(command, check=True)
     except sp.CalledProcessError as e:
-        raise gr.Error(f"Fout tijdens splitsen: {e}")
+        raise gr.Error(f"Demucs execution failed: {e}")
 
-    # 4. Verzamel de bestanden
-    # Demucs output structuur: generated/separated/htdemucs/Bestandsnaam/vocals.wav
-    target_folder = os.path.join(SEPARATED_DIR, "htdemucs", filename)
-    
-    drums = os.path.join(target_folder, "drums.wav")
-    bass = os.path.join(target_folder, "bass.wav")
-    other = os.path.join(target_folder, "other.wav")
-    vocals = os.path.join(target_folder, "vocals.wav")
+    # 5. Verify Output
+    drums = os.path.join(target_folder, f"{safe_name}_drums.wav")
+    bass = os.path.join(target_folder, f"{safe_name}_bass.wav")
+    other = os.path.join(target_folder, f"{safe_name}_other.wav")
+    vocals = os.path.join(target_folder, f"{safe_name}_vocals.wav")
 
-    print("--- SPLITSEN KLAAR ---")
+    print(f"--- SEPARATION COMPLETED. Output stored in: {target_folder} ---")
     
-    # Check of bestanden bestaan, anders None teruggeven
     return [
         drums if os.path.exists(drums) else None,
         bass if os.path.exists(bass) else None,
@@ -116,11 +150,15 @@ def separate_audio(audio_path):
         vocals if os.path.exists(vocals) else None
     ]
 
-# --- SAVING HELPER ---
+# --- FILE MANAGEMENT ---
+
 def save_track(current_file, filename_input):
+    """
+    Save the generated audio file with a custom filename and associated metadata.
+    """
     global LAST_METADATA
     
-    if current_file is None: return "⚠️ Genereer eerst muziek!"
+    if current_file is None: return "Generate audio first."
     if not filename_input: filename_input = f"track_{int(time.time())}"
     
     safe_name = "".join([c for c in filename_input if c.isalnum() or c in " _-"])
@@ -133,18 +171,22 @@ def save_track(current_file, filename_input):
         shutil.copy(current_file, wav_path)
         with open(json_path, 'w') as f:
             json.dump(LAST_METADATA, f, indent=4)
-        return f"✅ Opgeslagen: {safe_name}.wav"
+        return f"✅ Saved: {safe_name}.wav"
     except Exception as e:
-        return f"❌ Fout: {e}"
+        return f"❌ Error: {e}"
 
-# --- MODEL LADEN (MUSICGEN) ---
+# --- MODEL LOADING ---
+
 def load_model(version):
+    """Load the specified MusicGen model into memory."""
     global MODEL
     print(f"Loading MusicGen Model: {version}...")
+    
     if MODEL is not None and MODEL.name != version:
         del MODEL
         MODEL = None
         free_memory()
+        
     if MODEL is None:
         try:
             MODEL = MusicGen.get_pretrained(version)
@@ -152,35 +194,43 @@ def load_model(version):
             raise gr.Error(f"Error loading model: {e}")
 
 def load_diffusion():
+    """Load the MultiBand Diffusion decoder for high-quality audio reconstruction."""
     global MBD
     if MBD is None:
         print("Loading MultiBand Diffusion Decoder...")
         MBD = MultiBandDiffusion.get_mbd_musicgen()
 
-# --- GENERATIE LOGICA ---
+# --- GENERATION LOGIC ---
+
 def predict(model_name, decoder, text, melody, duration, topk, topp, temperature, cfg_coef, seed):
+    """
+    Main generation pipeline.
+    Handles Prompt Engineering, Model Loading, Generation, and Audio Decoding.
+    """
     global INTERRUPTING, USE_DIFFUSION, LAST_METADATA
     INTERRUPTING = False
     
-    # Kwaliteits-boost
+    # Prompt Engineering: Inject quality keywords if missing
     if "lo-fi" not in text.lower() and "high fidelity" not in text:
         text += ", high fidelity, wide stereo, 44kHz, crisp quality, well produced"
 
+    # Seed Management
     if seed == -1 or seed is None:
         seed = random.randint(0, 2**32 - 1)
     set_all_seeds(seed)
     
-    print(f"\n--- START GENERATIE: {text} ({duration}s) [Seed: {seed}] ---")
+    print(f"\n--- START GENERATION: {text} ({duration}s) [Seed: {seed}] ---")
     free_memory()
 
+    # Validation
     if melody is not None and "melody" not in model_name:
-        raise gr.Error(f"Model '{model_name}' ondersteunt geen melodie-input. Kies een 'melody' model.")
+        raise gr.Error(f"Model '{model_name}' does not support melody input.")
 
     load_model(model_name)
     
-    # Auto-fix voor Stereo + Diffusion
+    # Diffusion Logic (incompatible with Stereo models)
     if "stereo" in model_name and decoder == "MultiBand_Diffusion":
-        print("⚠️ WAARSCHUWING: Diffusion werkt niet met Stereo. Fallback naar Default.")
+        print("WARNING: Diffusion incompatible with Stereo models. Fallback to Default.")
         decoder = "Default"
         USE_DIFFUSION = False
     else:
@@ -193,10 +243,12 @@ def predict(model_name, decoder, text, melody, duration, topk, topp, temperature
         duration=duration, top_k=int(topk), top_p=topp, temperature=temperature, cfg_coef=cfg_coef
     )
     
+    # Progress Callback
     def _progress(generated, to_generate):
-        if INTERRUPTING: raise gr.Error("Gestopt.")
+        if INTERRUPTING: raise gr.Error("Interrupted by user.")
     MODEL.set_custom_progress_callback(_progress)
 
+    # Melody Processing
     melody_wavs = None
     if melody is not None:
         sr, audio = melody
@@ -205,6 +257,7 @@ def predict(model_name, decoder, text, melody, duration, topk, topp, temperature
         audio = audio[..., :int(sr * duration)]
         melody_wavs = [convert_audio(audio, sr, MODEL.sample_rate, MODEL.audio_channels)]
 
+    # Execution
     try:
         if melody_wavs:
             wav = MODEL.generate_with_chroma(descriptions=[text], melody_wavs=melody_wavs, 
@@ -214,44 +267,48 @@ def predict(model_name, decoder, text, melody, duration, topk, topp, temperature
     except RuntimeError as e:
         if "out of memory" in str(e):
             free_memory()
-            raise gr.Error("GPU Geheugen Vol! Probeer kortere duur.")
+            raise gr.Error("GPU OOM error. Try reducing duration.")
         raise e
 
+    # Decoding (Diffusion or Default)
     if USE_DIFFUSION and MBD:
         try:
             wav = MBD.tokens_to_wav(wav[1])
         except Exception as e:
-            print(f"Diffusion Error: {e}, fallback.")
+            print(f"Diffusion Error: {e}, fallback to default decoder.")
             wav = MODEL.compression_model.decode(wav[1])
 
+    # Save temporary output
     with NamedTemporaryFile("wb", suffix=".wav", delete=False) as tfile:
         audio_write(tfile.name, wav[0].cpu(), MODEL.sample_rate, strategy="peak", loudness_compressor=False, add_suffix=False)
         filename = tfile.name
     
+    # Metadata logging
     LAST_METADATA = {
         "prompt": text, "model": model_name, "seed": seed,
         "duration": duration, "cfg": cfg_coef, "decoder": decoder,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
     
-    print("--- KLAAR ---")
+    print("--- COMPLETED ---")
     return filename, seed
 
-# --- GUI ---
+# --- GUI INTERFACE ---
+
 def ui_full(launch_kwargs):
     theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="slate")
     
-    with gr.Blocks(title="MusicGen Pro + Demucs", theme=theme) as interface:
-        gr.Markdown("# 🎹 MusicGen Pro & Stem Splitter")
+    with gr.Blocks(title="MusicGen Pro", theme=theme) as interface:
+        gr.Markdown("# MusicGen Pro & Stem Splitter")
         
         with gr.Tabs():
-            # --- TAB 1: MUZIEK GENEREREN ---
-            with gr.TabItem("✨ Muziek Genereren"):
+            # --- TAB 1: MUSIC GENERATION ---
+            with gr.TabItem("✨ Generate Music"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        text = gr.Textbox(label="Beschrijving", placeholder="Typ hier (bv: 'Techno')...", lines=2)
+                        text = gr.Textbox(label="Description", placeholder="E.g. 'Techno, 140 BPM'...", lines=2)
 
-                        with gr.Tab("Instellingen"):
+                        with gr.Tab("Settings"):
                             model = gr.Dropdown(
                                 [
                                     "facebook/musicgen-small",
@@ -262,31 +319,31 @@ def ui_full(launch_kwargs):
                                 ],
                                 label="Model", value="facebook/musicgen-stereo-medium"
                             )
-                            duration = gr.Slider(5, 60, value=30, step=5, label="Duur")
-                            decoder = gr.Radio(["Default", "MultiBand_Diffusion"], label="Kwaliteit", value="Default")
+                            duration = gr.Slider(5, 60, value=30, step=5, label="Duration (s)")
+                            decoder = gr.Radio(["Default", "MultiBand_Diffusion"], label="Decoder Quality", value="Default")
                             seed_input = gr.Number(label="Seed (-1 = Random)", value=-1, precision=0)
 
-                        with gr.Tab("Melodie Uploaden"):
-                            melody = gr.Audio(source="upload", type="numpy", label="Melodie Input")
+                        with gr.Tab("Melody Input"):
+                            melody = gr.Audio(source="upload", type="numpy", label="Upload Melody (Optional)")
 
-                        with gr.Accordion("Expert", open=False):
-                            cfg_coef = gr.Slider(1.0, 10.0, value=3.0, label="Guidance")
-                            temperature = gr.Slider(0.1, 2.0, value=1.0, label="Temp")
+                        with gr.Accordion("Advanced Parameters", open=False):
+                            cfg_coef = gr.Slider(1.0, 10.0, value=3.0, label="CFG Guidance")
+                            temperature = gr.Slider(0.1, 2.0, value=1.0, label="Temperature")
                             topk = gr.Number(value=250, label="Top-k")
                             topp = gr.Number(value=0, label="Top-p")
 
                         with gr.Row():
-                            submit = gr.Button("🚀 Genereer", variant="primary")
-                            stop = gr.Button("🛑 Stop")
+                            submit = gr.Button("Generate", variant="primary")
+                            stop = gr.Button("Stop")
 
                     with gr.Column(scale=1):
-                        output = gr.Audio(label="Resultaat", type="filepath")
-                        used_seed_output = gr.Number(label="Gebruikte Seed", interactive=False)
+                        output = gr.Audio(label="Result", type="filepath")
+                        used_seed_output = gr.Number(label="Seed Used", interactive=False)
                         
-                        gr.Markdown("### 💾 Opslaan")
+                        gr.Markdown("### Save Output")
                         with gr.Row():
-                            filename_input = gr.Textbox(label="Bestandsnaam", placeholder="Mijn_Track", scale=3)
-                            save_btn = gr.Button("Opslaan", scale=1)
+                            filename_input = gr.Textbox(label="Filename", placeholder="My_Track", scale=3)
+                            save_btn = gr.Button("Save", scale=1)
                         
                         save_status = gr.Label(label="Status")
                         save_btn.click(save_track, inputs=[output, filename_input], outputs=save_status)
@@ -298,20 +355,20 @@ def ui_full(launch_kwargs):
                 )
                 stop.click(interrupt, queue=False)
 
-            # --- TAB 2: STEM SEPARATION (DEMUCS) ---
-            with gr.TabItem("✂️ Stem Splitter (Demucs)"):
-                gr.Markdown("Upload een liedje en Demucs splitst het in 4 sporen: **Drums, Bas, Overig, Stem**.")
+            # --- TAB 2: STEM SEPARATION ---
+            with gr.TabItem("✂️ Stem Splitter"):
+                gr.Markdown("Upload audio to separate into stems: **Drums, Bass, Other, Vocals**.")
                 
                 with gr.Row():
                     with gr.Column():
-                        input_separator = gr.Audio(type="filepath", label="Upload MP3/WAV")
-                        btn_separate = gr.Button("✂️ Splits Audio Nu", variant="primary")
+                        input_separator = gr.Audio(type="filepath", label="Input Audio")
+                        btn_separate = gr.Button("Separate Audio", variant="primary")
                     
                     with gr.Column():
-                        out_drums = gr.Audio(label="🥁 Drums", type="filepath")
-                        out_bass = gr.Audio(label="🎸 Bas", type="filepath")
-                        out_other = gr.Audio(label="🎹 Overig (Piano/Synth)", type="filepath")
-                        out_vocals = gr.Audio(label="🎤 Vocals (Stem)", type="filepath")
+                        out_drums = gr.Audio(label="Drums", type="filepath")
+                        out_bass = gr.Audio(label="Bass", type="filepath")
+                        out_other = gr.Audio(label="Other", type="filepath")
+                        out_vocals = gr.Audio(label="Vocals", type="filepath")
 
                 btn_separate.click(
                     separate_audio,
